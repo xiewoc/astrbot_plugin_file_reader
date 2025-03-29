@@ -3,3 +3,5 @@ pdfminer.six
 docx2txt
 pandas
 python-pptx
+python-magic
+python-magic-bin
