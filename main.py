@@ -11,17 +11,116 @@ import pandas as pd
 from docx import Document
 from pptx import Presentation
 from typing import Dict, Callable, Optional
+import chardet
+import mimetypes
+import magic  # python-magic库
 
 # 使用字典存储支持的文件类型和对应的处理函数
-SUPPORTED_EXTENSIONS: Dict[str, Callable] = {
+SUPPORTED_EXTENSIONS: Dict[str, str] = {
+    # 文档格式
     'pdf': 'read_pdf_to_text',
     'docx': 'read_docx_to_text',
-    'doc': 'read_docx_to_text',  # 添加对doc的支持
+    'doc': 'read_docx_to_text',
+    'rtf': 'read_txt_to_text',
+    'odt': 'read_txt_to_text',
+    
+    # 电子表格
     'xlsx': 'read_excel_to_text',
+    'xls': 'read_excel_to_text',
+    'ods': 'read_excel_to_text',
+    'csv': 'read_csv_to_text', 
+    
+    # 演示文稿
     'pptx': 'read_pptx_to_text',
-    'csv': 'read_txt_to_text',
+    'ppt': 'read_pptx_to_text',
+    'odp': 'read_pptx_to_text',
+    
+    # 编程语言源代码
+    'py': 'read_txt_to_text',
+    'java': 'read_txt_to_text',
+    'cpp': 'read_txt_to_text',
+    'c': 'read_txt_to_text',
+    'h': 'read_txt_to_text',
+    'hpp': 'read_txt_to_text',
+    'cs': 'read_txt_to_text',
+    'js': 'read_txt_to_text',
+    'ts': 'read_txt_to_text',
+    'php': 'read_txt_to_text',
+    'rb': 'read_txt_to_text',
+    'go': 'read_txt_to_text',
+    'rs': 'read_txt_to_text',
+    'swift': 'read_txt_to_text',
+    'kt': 'read_txt_to_text',
+    'scala': 'read_txt_to_text',
+    'sh': 'read_txt_to_text',
+    'bash': 'read_txt_to_text',
+    'ps1': 'read_txt_to_text',
+    'bat': 'read_txt_to_text',
+    'cmd': 'read_txt_to_text',
+    'vbs': 'read_txt_to_text',
+    
+    # 标记语言
+    'html': 'read_txt_to_text',
+    'htm': 'read_txt_to_text',
+    'xml': 'read_txt_to_text',
+    'json': 'read_txt_to_text',
+    'yaml': 'read_txt_to_text',
+    'yml': 'read_txt_to_text',
+    'md': 'read_txt_to_text',
+    'markdown': 'read_txt_to_text',
+    
+    # 配置文件
+    'ini': 'read_txt_to_text',
+    'cfg': 'read_txt_to_text',
+    'conf': 'read_txt_to_text',
+    'properties': 'read_txt_to_text',
+    'env': 'read_txt_to_text',
+    
+    # 数据库/查询
+    'sql': 'read_txt_to_text',
+    
+    # 其他文本格式
     'txt': 'read_txt_to_text',
+    'log': 'read_txt_to_text',
+    '': 'read_txt_to_text',  # 无扩展名文件
+    
+    # 构建/项目文件
+    'toml': 'read_txt_to_text',
+    'lock': 'read_txt_to_text',
+    'gitignore': 'read_txt_to_text',
+    
+    # 网络相关
+    'url': 'read_txt_to_text',
+    'webloc': 'read_txt_to_text',
 }
+
+
+def get_file_type(file_path: str) -> Optional[str]:
+    """安全获取文件扩展名（优先MIME检测，后备扩展名）"""
+    try:
+        # 方案1：使用python-magic（推荐）
+        import magic
+        mime = magic.from_file(file_path, mime=True)
+        mime_type = mime.split('/')[-1]
+        
+        # 特殊处理Office文档
+        if 'vnd.openxmlformats-officedocument' in mime:
+            return mime.split('.')[-1]  # 提取docx/pptx/xlsx
+        return mime_type
+        
+    except ImportError:
+        # 方案2：后备使用扩展名
+        ext = os.path.splitext(file_path)[1][1:].lower()
+        return ext if ext else None
+
+
+def read_csv_to_text(file_path: str) -> str:
+    """读取CSV文件并返回格式化的文本"""
+    try:
+        df = pd.read_csv(file_path)
+        return df.to_string(index=False)
+    except Exception as e:
+        raise RuntimeError(f"读取CSV文件失败: {str(e)}")
 
 def read_pdf_to_text(file_path: str) -> str:
     """使用pdfminer.six提取PDF文本（效果更好）"""
@@ -106,10 +205,12 @@ def read_pptx_to_text(file_path: str) -> str:
         raise RuntimeError(f"读取PPTX文件失败: {str(e)}")
 
 def read_txt_to_text(file_path: str) -> str:
-    """读取文本文件内容"""
+    """读取文本文件，自动检测编码"""
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            return f.read()
+        with open(file_path, 'rb') as f:
+            raw_data = f.read()
+            encoding = chardet.detect(raw_data)['encoding'] or 'utf-8'
+        return raw_data.decode(encoding)
     except Exception as e:
         raise RuntimeError(f"读取文本文件失败: {str(e)}")
 
@@ -120,12 +221,13 @@ def read_any_file_to_text(file_path: str) -> str:
     """
     try:
         # 获取文件扩展名（小写，不带点）
-        file_ext = os.path.splitext(file_path)[1][1:].lower()
-        
-        # 获取对应的处理函数名
+        file_ext = get_file_type(file_path)
+        if not file_ext:
+            return "无法检测文件类型"
+    
         func_name = SUPPORTED_EXTENSIONS.get(file_ext)
-        if func_name is None:
-            return f"暂不支持 {file_ext} 文件格式"
+        if not func_name:
+            return f"不支持 {file_ext} 格式"
         
         # 使用字典映射替代eval()更安全
         func_map = {
@@ -145,7 +247,7 @@ def read_any_file_to_text(file_path: str) -> str:
     except Exception as e:
         return f"读取文件时出错: {str(e)}"
 
-@register("astrbot_plugin_file_reader", "xiewoc", "一个将文件内容传给llm的插件", "1.0.0", "https://github.com/xiewoc/astrbot_plugin_file_reader")
+@register("astrbot_plugin_file_reader", "xiewoc", "一个将文件内容传给llm的插件", "1.0.1", "https://github.com/xiewoc/astrbot_plugin_file_reader")
 class astrbot_plugin_file_reader(Star):
     def __init__(self, context: Context):
         super().__init__(context)
