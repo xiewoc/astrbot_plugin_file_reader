@@ -156,8 +156,6 @@ class astrbot_plugin_file_reader(Star):
         '''当获取到有文件时'''
         for item in event.message_obj.message:
             if isinstance(item, File):
-                print("get file:",item.file)
-                print("content:",read_any_file_to_text(item.file))
 
                 global file_name
                 file_dir, file_name = os.path.split(item.file)
@@ -169,7 +167,6 @@ class astrbot_plugin_file_reader(Star):
     @filter.on_llm_request()
     async def my_custom_hook_1(self, event: AstrMessageEvent, req: ProviderRequest): 
         global content, file_name
-        print(req)
         if content != '' and file_name != '':
             req.prompt += '文件名：' + file_name + '文件内容:' + content
             content = ''
