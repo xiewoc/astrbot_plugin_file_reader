@@ -3,5 +3,6 @@ pdfminer.six
 docx2txt
 pandas
 python-pptx
-python-magic
-python-magic-bin
+python-magic; platform_system != 'Windows'
+python-magic-bin; platform_system == 'Windows'
+libmagic
