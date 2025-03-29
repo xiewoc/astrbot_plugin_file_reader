@@ -92,7 +92,6 @@ SUPPORTED_EXTENSIONS: Dict[str, str] = {
     "webloc": "read_txt_to_text",
 }
 
-
 def get_file_type(file_path: str) -> Optional[str]:
     """安全获取文件扩展名（优先MIME检测，后备扩展名）"""
     try:
@@ -110,7 +109,6 @@ def get_file_type(file_path: str) -> Optional[str]:
         # 方案2：后备使用扩展名
         ext = os.path.splitext(file_path)[1][1:].lower()
         return ext if ext else None
-
 
 def read_csv_to_text(file_path: str) -> str:
     """读取CSV文件并返回格式化的文本"""
@@ -218,30 +216,44 @@ def read_any_file_to_text(file_path: str) -> str:
     返回文件内容文本或错误信息
     """
     try:
+        # 修复路径编码问题
+        if isinstance(file_path, bytes):
+            try:
+                file_path = file_path.decode('utf-8')
+            except UnicodeDecodeError:
+                file_path = file_path.decode('latin1')
+        
+        # 标准化路径（处理反斜杠和特殊字符）
+        file_path = os.path.abspath(os.path.normpath(file_path))
+        
+        # 检查文件是否存在
+        if not os.path.exists(file_path):
+            return f"文件不存在: {file_path}"
+            
         # 获取文件扩展名（小写，不带点）
-        file_ext = get_file_type(file_path)
-        if not file_ext:
-            return "无法检测文件类型"
-
+        file_ext = os.path.splitext(file_path)[1][1:].lower()
+        
+        # 后续处理逻辑保持不变...
         func_name = SUPPORTED_EXTENSIONS.get(file_ext)
         if not func_name:
             return f"不支持 {file_ext} 格式"
-
-        # 使用字典映射替代eval()更安全
+            
+        # 使用函数映射
         func_map = {
             "read_pdf_to_text": read_pdf_to_text,
             "read_docx_to_text": read_docx_to_text,
             "read_excel_to_text": read_excel_to_text,
             "read_pptx_to_text": read_pptx_to_text,
             "read_txt_to_text": read_txt_to_text,
+            "read_csv_to_text": read_csv_to_text,
         }
-
+        
         func = func_map.get(func_name)
         if func is None:
             return f"找不到处理 {file_ext} 文件的函数"
-
+            
         return func(file_path)
-
+        
     except Exception as e:
         return f"读取文件时出错: {str(e)}"
 
@@ -250,22 +262,21 @@ class astrbot_plugin_file_reader(Star):
     def __init__(self, context: Context):
         super().__init__(context)
 
-
     @event_message_type(EventMessageType.ALL)
     async def on_receive_msg(self, event: AstrMessageEvent):
         """当获取到有文件时"""
-        for item in event.message_obj.message:
-            if isinstance(item, Comp.File):
-
-                global file_name
-                file_dir, file_name = os.path.split(item.file)
-
-                global content
-                content = read_any_file_to_text(item.file)
-
+        global file_name ,content
+        content = ""
+        file_name = ""
+        if event.is_at_or_wake_command:#如果是被唤醒的状态，即：先被at一下后发送
+            for item in event.message_obj.message:
+                if isinstance(item, Comp.File):
+                    
+                    file_dir, file_name = os.path.split(item.file)
+                    content = read_any_file_to_text(item.file)
 
     @filter.on_llm_request()
-    async def my_custom_hook_1(self, event: AstrMessageEvent, req: ProviderRequest):
+    async def on_request(self, event: AstrMessageEvent, req: ProviderRequest):
         global content, file_name
         if content != "" and file_name != "":
             req.prompt += "文件名：" + file_name + "文件内容:" + content
