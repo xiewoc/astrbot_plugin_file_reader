@@ -95,3 +95,5 @@ SUPPORTED_EXTENSIONS: Dict[str, str] = {
 ## previous updates
 
 支持了txt,csv,pptx,doc,docx,xlsx,pdf。剩下的以后再更新
+
+如有问题也可以进QQ群提问：`823193982`
