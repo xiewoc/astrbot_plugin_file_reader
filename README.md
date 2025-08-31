@@ -4,9 +4,14 @@
 
 先下载`requirements.txt`里面的库（`pip install -r requirements.txt`）
 
+`Linux` 用户可能需要安装 `libmagic`
+`sudo apt-get install libmagic1`
+
 在使用时发送文件并不会直接呼起llm，而是将文件内容加入prompt里面，在发送文字内容时就附带发送了
 
-本插件使用`[File]`表识识别文件，有可能局限于napcat，故其他平台用户请注意一下兼容性
+# v1.0.2
+
+使用了get_file()
 
 # v1.0.1
 
@@ -95,5 +100,3 @@ SUPPORTED_EXTENSIONS: Dict[str, str] = {
 ## previous updates
 
 支持了txt,csv,pptx,doc,docx,xlsx,pdf。剩下的以后再更新
-
-如有问题也可以进QQ群提问：`823193982`

@@ -1,6 +1,6 @@
 name: astrbot_plugin_file_reader
 desc: 一个将文件内容传给llm的插件
 help: 无特殊用法，正常使用便可
-version: v1.0.1
+version: v1.0.2
 author: xiewoc 
 repo: https://github.com/xiewoc/astrbot_plugin_file_reader
