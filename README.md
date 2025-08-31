@@ -5,7 +5,10 @@
 先下载`requirements.txt`里面的库（`pip install -r requirements.txt`）
 
 `Linux` 用户可能需要安装 `libmagic`
-`sudo apt-get install libmagic1`
+
+```
+sudo apt-get install libmagic1
+```
 
 在使用时发送文件并不会直接呼起llm，而是将文件内容加入prompt里面，在发送文字内容时就附带发送了
 
@@ -100,3 +103,4 @@ SUPPORTED_EXTENSIONS: Dict[str, str] = {
 ## previous updates
 
 支持了txt,csv,pptx,doc,docx,xlsx,pdf。剩下的以后再更新
+
