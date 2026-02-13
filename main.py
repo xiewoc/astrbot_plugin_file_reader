@@ -1,4 +1,4 @@
-﻿from astrbot.api.event import filter, AstrMessageEvent          # pyright: ignore[reportMissingImports]
+from astrbot.api.event import filter, AstrMessageEvent          # pyright: ignore[reportMissingImports]
 from astrbot.api.star import Context, Star, register            # pyright: ignore[reportMissingImports]
 from astrbot.api.provider import ProviderRequest                # pyright: ignore[reportMissingImports]
 import astrbot.api.message_components as Comp                   # pyright: ignore[reportMissingImports] 
