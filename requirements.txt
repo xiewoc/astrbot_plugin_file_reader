@@ -1,0 +1,14 @@
+pdfminer.six
+docx2txt
+python-docx
+pandas
+openpyxl
+xlrd
+python-pptx
+python-magic
+chardet
+lxml
+numpy
+odfpy
+xlsxwriter
+python-magic-bin
