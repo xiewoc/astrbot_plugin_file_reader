@@ -1,7 +1,5 @@
 # astrbot_plugin_file_reader
 
-# 似乎已经可以不用这个插件了，官方似乎已经支持了，感谢各位的issue与陪伴
-
 ## 使用
 
 先下载`requirements.txt`里面的库（`pip install -r requirements.txt`）
