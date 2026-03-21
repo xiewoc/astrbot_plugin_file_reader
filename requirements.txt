@@ -11,4 +11,3 @@ lxml
 numpy
 odfpy
 xlsxwriter
-python-magic-bin
