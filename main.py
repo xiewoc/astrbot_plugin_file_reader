@@ -6,6 +6,11 @@ from astrbot.api.all import *                                   # pyright: ignor
 from astrbot.api import logger                                  # pyright: ignore[reportMissingImports]
 
 import os
+import asyncio
+import hashlib
+
+from astrbot.core.agent.message import TextPart
+from .session_cache import SessionFileCache, build_file_context, make_scope, mentions_file
 from datetime import datetime as dt  # 正确导入datetime类
 from enum import Enum
 from dataclasses import dataclass
@@ -144,7 +149,7 @@ FILE_TYPES_CONFIG = {
         category=FileCategory.TEXT,
         handler="read_text_file",
         mime_types={"text/plain", "text/x-python", "application/json", "text/xml", "text/html"},
-        max_size=10 * 1024 * 1024  # 10MB限制
+        max_size=20 * 1024 * 1024  # 与插件单文件大小上限保持一致
     ),
 }
 
@@ -541,7 +546,9 @@ class FileReader:
             
             # 读取文件
             content = handler(file_path)
-            
+            if not content or not content.strip():
+                raise FileReaderError("文件没有可提取的文字（扫描版 PDF 暂不支持）")
+
             # 限制长度
             if max_length and len(content) > max_length:
                 content = content[:max_length] + f"\n\n[内容截断，总长度: {len(content):,} 字符]"
@@ -581,108 +588,123 @@ def read_any_file_to_text(file_path: str, max_length: Optional[int] = None) -> s
     except Exception as e:
         return f"读取文件时发生错误: {str(e)}"
 
-@register("astrbot_plugin_file_reader", "xiewoc", 
-          "一个将文件内容传给llm的插件", "1.0.3", 
+@register("astrbot_plugin_file_reader", "xiewoc",
+          "一个将文件内容传给llm的插件", "1.0.3",
           "https://github.com/xiewoc/astrbot_plugin_file_reader")
 class astrbot_plugin_file_reader(Star):
+    """Read files on upload, but invoke the LLM only for file-related questions."""
+
     def __init__(self, context: Context):
         super().__init__(context)
-        self.current_file_info: Optional[Dict] = None
-        self.file_reader = FileReader(max_file_size=100 * 1024 * 1024)  # 限制10MB
-        self.reading_history = []  # 读取历史记录
-        
-    async def _process_file(self, file_item: Comp.File) -> Optional[Dict]:
-        """处理单个文件"""
+        self.file_reader = FileReader(max_file_size=20 * 1024 * 1024)
+        self.cache = SessionFileCache()
+        self._reader_semaphore = asyncio.Semaphore(1)
+        self._sweeper = None
+        self.reading_history = []
+
+    async def _sweep_periodically(self):
+        while True:
+            await asyncio.sleep(60)
+            self.cache.sweep()
+
+    def _read_local_file(self, path: str) -> tuple[str, str, bool]:
+        """Read AstrBot's existing local copy without modifying it."""
+        digest = hashlib.sha256()
+        with open(path, "rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        content = self.file_reader.read_file(path, max_length=40000)
+        truncated = "[内容截断" in content or len(content) > 40000
+        return digest.hexdigest(), content[:40000], truncated
+
+    async def _process_file(self, item: Comp.File, scope: str) -> bool:
         try:
-            # 获取文件
-            file_path = await file_item.get_file()
-            logger.info(f"接收到文件: {file_path}")
-            
-            # 读取文件内容
-            content = self.file_reader.read_file(file_path, max_length=100000)  # 限制100K字符
-            
-            # 记录读取历史
-            self.reading_history.append({
-                "filename": Path(file_path).name,
-                "timestamp": dt.now().isoformat(),  # 使用dt.now()
-                "size": Path(file_path).stat().st_size if Path(file_path).exists() else 0,
-                "success": True
-            })
-            
-            # 限制历史记录长度
-            if len(self.reading_history) > 100:
+            path = await item.get_file()
+            if not path:
+                raise FileNotFoundError("附件尚未下载")
+            if Path(path).stat().st_size > self.file_reader.max_file_size:
+                raise FileTooLargeError("附件超过 20 MB 的读取上限")
+            async with self._reader_semaphore:
+                digest, content, truncated = await asyncio.to_thread(
+                    self._read_local_file, path
+                )
+            if not content.strip():
+                logger.warning("文件无可读取的文字，可能是扫描版 PDF")
+                return False
+            name = Path(str(getattr(item, "name", "") or path).replace("\\", "/")).name
+            added = self.cache.add(
+                scope, filename=name, digest=digest,
+                text=content, truncated=truncated,
+            )
+            if added:
+                self.reading_history.append({
+                    "filename": name,
+                    "timestamp": dt.now().isoformat(),
+                    "success": True,
+                })
                 self.reading_history = self.reading_history[-50:]
-            
-            return {
-                "path": file_path,
-                "name": Path(file_path).name,
-                "content": content,
-                "size": len(content)
-            }
-            
-        except FileNotFoundError:
-            logger.error(f"文件不存在: {file_path}")
-        except FileTooLargeError as e:
-            logger.error(f"文件过大: {str(e)}")
-        except UnsupportedFileError as e:
-            logger.warning(f"不支持的文件格式: {str(e)}")
-        except DependencyMissingError as e:
-            logger.error(f"缺少依赖: {str(e)}")
-        except Exception as e:
-            logger.error(f"读取文件失败: {str(e)}\n{traceback.format_exc()}")
-            
-        return None
-    
-    @event_message_type(EventMessageType.ALL)               # type: ignore
+            return added
+        except (FileNotFoundError, FileTooLargeError, UnsupportedFileError,
+                DependencyMissingError, FileReaderError) as exc:
+            logger.warning("文件读取失败：%s", str(exc).splitlines()[0])
+        except Exception:
+            logger.exception("文件接收或解析失败")
+        return False
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_receive_msg(self, event: AstrMessageEvent):
-        """当获取到有文件时"""
-        if event.is_at_or_wake_command:
-            file_items = []
-            
-            # 收集所有文件
-            for item in event.message_obj.message:
-                if isinstance(item, Comp.File):
-                    file_items.append(item)
-            
-            # 处理文件
-            for file_item in file_items:
-                file_info = await self._process_file(file_item)
-                
-                if file_info and file_info["content"]:
-                    self.current_file_info = file_info
-                    logger.info(f"成功读取文件: {file_info['name']}，大小: {len(file_info['content']):,} 字符")
-                    
-                    # 可以在这里发送确认消息
-                    # await event.reply(f"已读取文件: {file_info['name']}")
-                else:
-                    logger.warning(f"读取文件内容为空或失败")
-                    self.current_file_info = None
-    
+        """File attachments need not carry an @ mention or wake command."""
+        scope = make_scope(event)
+        if self._sweeper is None or self._sweeper.done():
+            self._sweeper = asyncio.create_task(self._sweep_periodically())
+        for item in event.get_messages():
+            if isinstance(item, Comp.File):
+                await self._process_file(item, scope)
+        # Do not auto-reply: duplicate acknowledgments in multi-bot groups
+        # are more disruptive than a silent upload. /readfiles lists uploads.
+
+    @filter.command("readfiles")
+    async def list_files(self, event: AstrMessageEvent):
+        """Show files visible to the current group or private conversation."""
+        files = self.cache.list(make_scope(event))
+        if not files:
+            yield event.plain_result("当前会话没有可用的文件。")
+            return
+        names = "\n".join(f"• {doc.filename}" for doc in files)
+        yield event.plain_result(f"当前会话的文件：\n{names}")
+
     @filter.on_llm_request()
     async def on_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        """将文件内容添加到LLM请求"""
-        if self.current_file_info and self.current_file_info["content"]:
-            file_info = self.current_file_info
-            
-            # 格式化文件内容
-            file_context = (
-                f"\nFile name:{file_info['name']}\n"
-                f"\n[SOF]\n"
-                f"{file_info['content']}\n"
-                f"[EOF]\n"
+        """Only include text from a file in the requesting chat's scope."""
+        scope = make_scope(event)
+        files = self.cache.list(scope)
+        if not files or not mentions_file(req.prompt or "", [f.filename for f in files]):
+            return
+        selected, ambiguous = self.cache.choose(scope, req.prompt or "")
+        if ambiguous:
+            options = "、".join(doc.filename for doc in files)
+            context = (
+                f"当前会话有多份文件：{options}。"
+                "请先询问用户要分析哪一份，不要自行猜测文件内容。"
             )
-            
-            # 添加到提示词
-            req.prompt += file_context
-            logger.info(f"已将文件 {file_info['name']} 内容添加到请求中")
-            
-            # 清空当前文件信息
-            self.current_file_info = None
-    
+        elif selected:
+            context = build_file_context(selected)
+        else:
+            return
+        req.extra_user_content_parts.append(TextPart(text=context).mark_as_temp())
+
     def get_stats(self) -> Dict:
-        """获取插件统计信息"""
         return {
             "total_read": len(self.reading_history),
-            "success_read": sum(1 for h in self.reading_history if h.get("success", False)),
-            "recent_files": self.reading_history[-10:] if self.reading_history else []
+            "success_read": sum(1 for h in self.reading_history if h.get("success")),
+            "recent_files": self.reading_history[-10:],
         }
+
+    async def terminate(self):
+        if self._sweeper is not None:
+            self._sweeper.cancel()
+            try:
+                await self._sweeper
+            except asyncio.CancelledError:
+                pass
+        self.cache._entries.clear()
