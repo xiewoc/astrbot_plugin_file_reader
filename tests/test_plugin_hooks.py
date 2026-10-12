@@ -124,24 +124,43 @@ class PluginTests(unittest.TestCase):
     def test_receive_without_wake_and_inject_only_to_same_group(self):
         async def run():
             # Place test fixtures in the requested D: project workspace.
-            with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as tmp:
+            with tempfile.TemporaryDirectory(
+                dir=Path(__file__).resolve().parents[1]
+            ) as tmp:
                 f = Path(tmp, "report.txt")
                 f.write_text("GROUP_A_PRIVATE_DATA", encoding="utf-8")
-                sent = FakeEvent("group-A", "user-1", [FileSegment(str(f), "report.txt")])
+                sent = FakeEvent(
+                    "group-A", "user-1", [FileSegment(str(f), "report.txt")]
+                )
                 await self.plugin.on_receive_msg(sent)
-                self.assertEqual(len(self.plugin.cache.list("qq_official\x1fqq1\x1fgroup\x1fgroup-A")), 1)
-                req = SimpleNamespace(prompt="请总结 report.txt", extra_user_content_parts=[])
+                self.assertEqual(
+                    len(
+                        self.plugin.cache.list("qq_official\x1fqq1\x1fgroup\x1fgroup-A")
+                    ),
+                    1,
+                )
+                req = SimpleNamespace(
+                    prompt="请总结 report.txt", extra_user_content_parts=[]
+                )
                 await self.plugin.on_request(FakeEvent("group-A", "user-2"), req)
                 self.assertEqual(len(req.extra_user_content_parts), 1)
-                self.assertIn("GROUP_A_PRIVATE_DATA", req.extra_user_content_parts[0].text)
+                self.assertIn(
+                    "GROUP_A_PRIVATE_DATA", req.extra_user_content_parts[0].text
+                )
                 self.assertTrue(req.extra_user_content_parts[0].temporary)
 
-                other = SimpleNamespace(prompt="请总结 report.txt", extra_user_content_parts=[])
+                other = SimpleNamespace(
+                    prompt="请总结 report.txt", extra_user_content_parts=[]
+                )
                 await self.plugin.on_request(FakeEvent("group-B", "user-3"), other)
                 self.assertEqual(other.extra_user_content_parts, [])
 
-                other_adapter = SimpleNamespace(prompt="请总结 report.txt", extra_user_content_parts=[])
-                await self.plugin.on_request(FakeEvent("group-A", "user-3", adapter="qq2"), other_adapter)
+                other_adapter = SimpleNamespace(
+                    prompt="请总结 report.txt", extra_user_content_parts=[]
+                )
+                await self.plugin.on_request(
+                    FakeEvent("group-A", "user-3", adapter="qq2"), other_adapter
+                )
                 self.assertEqual(other_adapter.extra_user_content_parts, [])
 
                 casual = SimpleNamespace(prompt="你好", extra_user_content_parts=[])
@@ -149,18 +168,27 @@ class PluginTests(unittest.TestCase):
                 self.assertEqual(casual.extra_user_content_parts, [])
 
                 await self.plugin.on_receive_msg(sent)
-                self.assertEqual(len(self.plugin.cache.list("qq_official\x1fqq1\x1fgroup\x1fgroup-A")), 1)
+                self.assertEqual(
+                    len(
+                        self.plugin.cache.list("qq_official\x1fqq1\x1fgroup\x1fgroup-A")
+                    ),
+                    1,
+                )
+
         asyncio.run(run())
 
     def test_scanlike_empty_text_rejected(self):
         async def run():
-            with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as tmp:
+            with tempfile.TemporaryDirectory(
+                dir=Path(__file__).resolve().parents[1]
+            ) as tmp:
                 f = Path(tmp, "blank.txt")
                 f.write_text("", encoding="utf-8")
                 await self.plugin.on_receive_msg(
                     FakeEvent("group-A", "user-1", [FileSegment(str(f), "blank.txt")])
                 )
                 self.assertEqual(self.plugin.reading_history, [])
+
         asyncio.run(run())
 
 

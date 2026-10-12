@@ -20,6 +20,7 @@ import tempfile
 import traceback
 from functools import lru_cache
 import warnings
+from zipfile import BadZipFile, ZipFile
 
 # 可选依赖导入，提供更好的错误信息
 try:
@@ -419,28 +420,22 @@ class FileReader:
             raise DependencyMissingError("需要安装 pandas 库")
             
         try:
-            # 尝试读取所有工作表
-            excel_file = pd.ExcelFile(file_path)
+            # ExcelFile must be closed, especially on Windows where open
+            # handles can prevent cleanup of AstrBot's temporary attachments.
             results = []
-            
-            for sheet_name in excel_file.sheet_names:
-                try:
-                    df = pd.read_excel(excel_file, sheet_name=sheet_name)
-                    
-                    # 处理空表
-                    if df.empty:
-                        results.append(f"工作表: {sheet_name} (空)")
-                        continue
-                    
-                    # 转换为文本
-                    text = df.to_string(index=False, na_rep='NA')
-                    results.append(f"工作表: {sheet_name}\n{text}")
-                    
-                except Exception as e:
-                    results.append(f"工作表: {sheet_name} (读取失败: {str(e)})")
-                    continue
-            
-            return "\n\n" + "="*50 + "\n\n".join(results)
+            with pd.ExcelFile(file_path) as excel_file:
+                for sheet_name in excel_file.sheet_names:
+                    try:
+                        df = pd.read_excel(excel_file, sheet_name=sheet_name, header=None)
+                        if df.empty:
+                            results.append(f"工作表: {sheet_name} (空)")
+                            continue
+                        text = df.to_string(index=False, na_rep="NA")
+                        results.append(f"工作表: {sheet_name}\n{text}")
+                    except Exception as e:
+                        results.append(f"工作表: {sheet_name} (读取失败: {type(e).__name__})")
+
+            return "\n\n" + "=" * 50 + "\n\n".join(results)
             
         except Exception as e:
             raise FileReaderError(f"读取Excel文件失败: {e}")
@@ -528,6 +523,29 @@ class FileReader:
             file_path, file_type = self.validate_file(file_path)
             
             # 检查依赖
+            # Guard compressed Office formats against oversized expansion.
+            if file_path.suffix.lower() in {
+                ".docx", ".xlsx", ".xlsm", ".pptx", ".ods", ".odp"
+            }:
+                try:
+                    with ZipFile(file_path) as archive:
+                        entries = archive.infolist()
+                        expanded = sum(entry.file_size for entry in entries)
+                        if len(entries) > 2000 or expanded > 80 * 1024 * 1024:
+                            raise FileReaderError("Office 文件解压后体积过大")
+                        for entry in entries:
+                            if entry.file_size > 40 * 1024 * 1024:
+                                raise FileReaderError("Office 文件内部条目过大")
+                            if entry.flag_bits & 1:
+                                raise FileReaderError("暂不支持加密的 Office 文件")
+                            if (
+                                entry.file_size > 1024 * 1024
+                                and entry.file_size > max(entry.compress_size, 1) * 400
+                            ):
+                                raise FileReaderError("Office 文件压缩比例异常")
+                except BadZipFile as exc:
+                    raise FileReaderError("不是有效的 Office 文档") from exc
+
             self.check_dependencies(file_type)
             
             # 选择处理函数

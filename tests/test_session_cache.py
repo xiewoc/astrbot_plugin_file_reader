@@ -5,7 +5,12 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from session_cache import SessionFileCache, build_file_context, make_scope, mentions_file
+from session_cache import (
+    SessionFileCache,
+    build_file_context,
+    make_scope,
+    mentions_file,
+)
 
 
 class Event:
@@ -38,7 +43,9 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(group_a, same_group_member)
         self.assertNotEqual(group_a, group_b)
         self.assertNotEqual(group_a, other_bot)
-        cache.add(group_a, filename="report.txt", digest="one", text="hello", truncated=False)
+        cache.add(
+            group_a, filename="report.txt", digest="one", text="hello", truncated=False
+        )
         self.assertEqual(len(cache.list(same_group_member)), 1)
         self.assertEqual(cache.list(group_b), [])
         self.assertEqual(cache.list(other_bot), [])
@@ -52,8 +59,12 @@ class CacheTests(unittest.TestCase):
 
     def test_duplicate_and_file_count(self):
         cache = SessionFileCache(max_files_per_scope=2)
-        self.assertTrue(cache.add("group", filename="a", digest="x", text="first", truncated=False))
-        self.assertFalse(cache.add("group", filename="a", digest="x", text="first", truncated=False))
+        self.assertTrue(
+            cache.add("group", filename="a", digest="x", text="first", truncated=False)
+        )
+        self.assertFalse(
+            cache.add("group", filename="a", digest="x", text="first", truncated=False)
+        )
         cache.add("group", filename="b", digest="y", text="second", truncated=False)
         cache.add("group", filename="c", digest="z", text="third", truncated=False)
         self.assertEqual([item.filename for item in cache.list("group")], ["b", "c"])
@@ -68,8 +79,12 @@ class CacheTests(unittest.TestCase):
 
     def test_global_char_budget(self):
         cache = SessionFileCache(max_total_chars=1000)
-        cache.add("a", filename="a", digest="a", text="a" * 700, truncated=False, now=10)
-        cache.add("b", filename="b", digest="b", text="b" * 700, truncated=False, now=20)
+        cache.add(
+            "a", filename="a", digest="a", text="a" * 700, truncated=False, now=10
+        )
+        cache.add(
+            "b", filename="b", digest="b", text="b" * 700, truncated=False, now=20
+        )
         with patch("session_cache.time.monotonic", return_value=25):
             self.assertFalse(cache.list("a"))
             self.assertEqual(len(cache.list("b")), 1)
