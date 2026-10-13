@@ -104,6 +104,8 @@ def _load_plugin():
     modules["astrbot.api"].logger = SimpleNamespace(
         warning=lambda *a, **kw: None,
         exception=lambda *a, **kw: None,
+        info=lambda *a, **kw: None,
+        error=lambda *a, **kw: None,
     )
     root = Path(__file__).resolve().parents[1]
     pkg = types.ModuleType("_reader_pr_test")
@@ -188,6 +190,42 @@ class PluginTests(unittest.TestCase):
                     FakeEvent("group-A", "user-1", [FileSegment(str(f), "blank.txt")])
                 )
                 self.assertEqual(self.plugin.reading_history, [])
+
+        asyncio.run(run())
+
+    def test_unknown_filename_never_injects_cached_text(self):
+        async def run():
+            scope = "qq_official\x1fqq1\x1fgroup\x1fgroup-A"
+            self.plugin.cache.add(
+                scope,
+                filename="known.txt",
+                digest="one",
+                text="PRIVATE_MARKER",
+                truncated=False,
+            )
+            req = SimpleNamespace(prompt="读 another.txt", extra_user_content_parts=[])
+            await self.plugin.on_request(FakeEvent("group-A", "u1"), req)
+            self.assertEqual(len(req.extra_user_content_parts), 1)
+            self.assertNotIn("PRIVATE_MARKER", req.extra_user_content_parts[0].text)
+            unrelated = SimpleNamespace(
+                prompt="帮我总结今天的聊天", extra_user_content_parts=[]
+            )
+            await self.plugin.on_request(FakeEvent("group-A", "u1"), unrelated)
+            self.assertEqual(unrelated.extra_user_content_parts, [])
+
+        asyncio.run(run())
+
+    def test_failed_download_does_not_cache_file(self):
+        class BrokenFile(FileSegment):
+            async def get_file(self):
+                raise TimeoutError("test timeout")
+
+        async def run():
+            sent = FakeEvent("group-A", "u1", [BrokenFile("", "broken.txt")])
+            await self.plugin.on_receive_msg(sent)
+            self.assertEqual(
+                self.plugin.cache.list("qq_official\x1fqq1\x1fgroup\x1fgroup-A"), []
+            )
 
         asyncio.run(run())
 

@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from zipfile import ZIP_DEFLATED, ZipFile
 
 WORKSPACE = Path(__file__).resolve().parents[1]
@@ -174,6 +175,53 @@ class RealDocuments(unittest.TestCase):
         small_reader = self.main.FileReader(max_file_size=1024)
         with self.assertRaises(self.main.FileTooLargeError):
             small_reader.read_file(f)
+
+    def test_pdf_extraction_stops_at_character_budget(self):
+        if not self.main.PDFMINER_AVAILABLE:
+            self.skipTest("pdfminer not installed")
+        f = self.root / "short.pdf"
+        _create_pdf(f, "TINY")
+
+        # Simulate a large single text element while preserving a tiny input.
+        class FakeTextBox:
+            def get_text(self):
+                return "X" * 1000000
+
+        with (
+            patch.object(self.main, "LTTextContainer", FakeTextBox),
+            patch.object(
+                self.main, "pdf_extract_pages", return_value=[[FakeTextBox()]]
+            ),
+        ):
+            text = self.reader.read_pdf_to_text(f, max_length=100)
+        self.assertLessEqual(len(text), 101)
+
+    def test_zip_guard_applies_to_renamed_office_archive(self):
+        f = self.root / "renamed.dat"
+        with ZipFile(f, "w", compression=ZIP_DEFLATED) as archive:
+            archive.writestr("word/document.xml", b"A" * (2 * 1024 * 1024))
+        with (
+            patch.object(self.reader, "detect_file_type", return_value="docx"),
+            self.assertRaisesRegex(self.main.FileReaderError, "压缩比例异常"),
+        ):
+            self.reader.read_file(f, max_length=40000)
+
+    def test_excel_all_sheets_failed_is_an_error(self):
+        if not self.main.PANDAS_AVAILABLE:
+            self.skipTest("pandas not installed")
+        from openpyxl import Workbook
+
+        f = self.root / "failure.xlsx"
+        wb = Workbook()
+        wb.active["A1"] = "data"
+        wb.save(f)
+        with (
+            patch.object(
+                self.main.pd, "read_excel", side_effect=ValueError("unreadable")
+            ),
+            self.assertRaises(self.main.FileReaderError),
+        ):
+            self.reader.read_file(f, max_length=40000)
 
 
 if __name__ == "__main__":

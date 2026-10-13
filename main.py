@@ -8,6 +8,7 @@ from astrbot.api import logger                                  # pyright: ignor
 import os
 import asyncio
 import hashlib
+import time
 
 from astrbot.core.agent.message import TextPart
 from .session_cache import SessionFileCache, build_file_context, make_scope, mentions_file
@@ -24,11 +25,13 @@ from zipfile import BadZipFile, ZipFile
 
 # 可选依赖导入，提供更好的错误信息
 try:
-    from pdfminer.high_level import extract_text as pdf_extract_text
+    from pdfminer.high_level import extract_pages as pdf_extract_pages
+    from pdfminer.layout import LTTextContainer
     PDFMINER_AVAILABLE = True
 except ImportError:
     PDFMINER_AVAILABLE = False
-    pdf_extract_text = None
+    pdf_extract_pages = None
+    LTTextContainer = None
 
 try:
     import docx2txt
@@ -352,19 +355,39 @@ class FileReader:
             f"无法解码文件 {file_path}，尝试的编码: {encodings_to_try}，最后错误: {last_error}"
         )
     
-    def read_pdf_to_text(self, file_path: Path) -> str:
-        """读取PDF文件"""
+    def read_pdf_to_text(self, file_path: Path, max_length: int = 40000) -> str:
+        """Extract page-by-page and stop at the text/page budget."""
         if not PDFMINER_AVAILABLE:
             raise DependencyMissingError("需要安装 pdfminer.six 库")
-            
+        # pdfminer still expands each page internally. A per-page memory limit
+        # cannot be guaranteed in this Python process; keep a conservative
+        # compressed input cap and do not parse large untrusted PDFs.
+        if file_path.stat().st_size > 5 * 1024 * 1024:
+            raise FileTooLargeError("PDF 文件超过保守的 5 MB 安全限制")
+        parts = []
+        count = 0
+        limit = max_length if max_length else 40000
         try:
-            # 使用io.StringIO捕获输出
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                text = pdf_extract_text(str(file_path))
-                return text.strip()
-        except Exception as e:
-            raise FileReaderError(f"读取PDF文件失败: {e}")
+                for page_idx, page in enumerate(
+                    pdf_extract_pages(str(file_path), maxpages=60, caching=False)
+                ):
+                    for element in page:
+                        if isinstance(element, LTTextContainer):
+                            raw = element.get_text()
+                            room = limit + 1 - count
+                            if room <= 0:
+                                break
+                            parts.append(raw[:room])
+                            count += min(len(raw), room)
+                    if count > limit or page_idx >= 59:
+                        break
+            return "".join(parts).strip()
+        except (FileReaderError, FileTooLargeError):
+            raise
+        except Exception as exc:
+            raise FileReaderError(f"读取 PDF 失败（{type(exc).__name__}）") from exc
     
     def convert_doc_to_docx(self, doc_file: Path, docx_file: Path) -> None:
         """转换DOC到DOCX格式"""
@@ -423,10 +446,12 @@ class FileReader:
             # ExcelFile must be closed, especially on Windows where open
             # handles can prevent cleanup of AstrBot's temporary attachments.
             results = []
+            parsed_sheets = 0
             with pd.ExcelFile(file_path) as excel_file:
                 for sheet_name in excel_file.sheet_names:
                     try:
                         df = pd.read_excel(excel_file, sheet_name=sheet_name, header=None)
+                        parsed_sheets += 1
                         if df.empty:
                             results.append(f"工作表: {sheet_name} (空)")
                             continue
@@ -435,6 +460,8 @@ class FileReader:
                     except Exception as e:
                         results.append(f"工作表: {sheet_name} (读取失败: {type(e).__name__})")
 
+            if not parsed_sheets:
+                raise FileReaderError("Excel 所有工作表均读取失败")
             return "\n\n" + "=" * 50 + "\n\n".join(results)
             
         except Exception as e:
@@ -524,9 +551,12 @@ class FileReader:
             
             # 检查依赖
             # Guard compressed Office formats against oversized expansion.
-            if file_path.suffix.lower() in {
-                ".docx", ".xlsx", ".xlsm", ".pptx", ".ods", ".odp"
-            }:
+            with file_path.open("rb") as header_file:
+                zip_header = header_file.read(4).startswith(b"PK\x03\x04")
+            if file_type in {"docx", "excel", "pptx"} and (
+                file_path.suffix.lower() in {".docx", ".xlsx", ".xlsm", ".pptx", ".ods", ".odp"}
+                or zip_header
+            ):
                 try:
                     with ZipFile(file_path) as archive:
                         entries = archive.infolist()
@@ -563,7 +593,7 @@ class FileReader:
                 raise UnsupportedFileError(f"没有找到处理 {file_type} 的处理器")
             
             # 读取文件
-            content = handler(file_path)
+            content = handler(file_path, max_length=max_length) if file_type == "pdf" else handler(file_path)
             if not content or not content.strip():
                 raise FileReaderError("文件没有可提取的文字（扫描版 PDF 暂不支持）")
 
@@ -635,9 +665,10 @@ class astrbot_plugin_file_reader(Star):
         truncated = "[内容截断" in content or len(content) > 40000
         return digest.hexdigest(), content[:40000], truncated
 
-    async def _process_file(self, item: Comp.File, scope: str) -> bool:
+    async def _process_file(self, item: Comp.File, scope: str, received_at: float) -> bool:
+        label = hashlib.sha256(scope.encode()).hexdigest()[:10]
         try:
-            path = await item.get_file()
+            path = await asyncio.wait_for(item.get_file(), timeout=20)
             if not path:
                 raise FileNotFoundError("附件尚未下载")
             if Path(path).stat().st_size > self.file_reader.max_file_size:
@@ -652,7 +683,7 @@ class astrbot_plugin_file_reader(Star):
             name = Path(str(getattr(item, "name", "") or path).replace("\\", "/")).name
             added = self.cache.add(
                 scope, filename=name, digest=digest,
-                text=content, truncated=truncated,
+                text=content, truncated=truncated, received_at=received_at,
             )
             if added:
                 self.reading_history.append({
@@ -661,23 +692,34 @@ class astrbot_plugin_file_reader(Star):
                     "success": True,
                 })
                 self.reading_history = self.reading_history[-50:]
+            logger.info(
+                f"[file_reader] parsed scope={label} size_chars={len(content)} "
+                f"stored={added} truncated={truncated}"
+            )
             return added
+        except TimeoutError:
+            logger.warning(f"[file_reader] download timeout scope={label} limit=20s")
         except (FileNotFoundError, FileTooLargeError, UnsupportedFileError,
                 DependencyMissingError, FileReaderError) as exc:
-            logger.warning("文件读取失败：%s", str(exc).splitlines()[0])
+            # Do not log untrusted paths, original file content or access tokens.
+            logger.warning(f"[file_reader] failed scope={label} cause={type(exc).__name__}")
         except Exception:
-            logger.exception("文件接收或解析失败")
+            logger.error(f"[file_reader] unexpected failure scope={label}")
         return False
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_receive_msg(self, event: AstrMessageEvent):
         """File attachments need not carry an @ mention or wake command."""
         scope = make_scope(event)
+        received_at = time.monotonic()
         if self._sweeper is None or self._sweeper.done():
             self._sweeper = asyncio.create_task(self._sweep_periodically())
-        for item in event.get_messages():
-            if isinstance(item, Comp.File):
-                await self._process_file(item, scope)
+        files = [item for item in event.get_messages() if isinstance(item, Comp.File)]
+        if files:
+            label = hashlib.sha256(scope.encode()).hexdigest()[:10]
+            logger.info(f"[file_reader] attachment event scope={label} count={len(files)}")
+        for item in files:
+            await self._process_file(item, scope, received_at)
         # Do not auto-reply: duplicate acknowledgments in multi-bot groups
         # are more disruptive than a silent upload. /readfiles lists uploads.
 
@@ -686,7 +728,7 @@ class astrbot_plugin_file_reader(Star):
         """Show files visible to the current group or private conversation."""
         files = self.cache.list(make_scope(event))
         if not files:
-            yield event.plain_result("当前会话没有可用的文件。")
+            yield event.plain_result("当前会话没有已读取文件。请先发送附件；若已发送，请检查 AstrBot 日志中的 [file_reader] 记录。")
             return
         names = "\n".join(f"• {doc.filename}" for doc in files)
         yield event.plain_result(f"当前会话的文件：\n{names}")
@@ -696,20 +738,25 @@ class astrbot_plugin_file_reader(Star):
         """Only include text from a file in the requesting chat's scope."""
         scope = make_scope(event)
         files = self.cache.list(scope)
-        if not files or not mentions_file(req.prompt or "", [f.filename for f in files]):
+        filenames = [name for file in files for name in file.filenames]
+        if not mentions_file(req.prompt or "", filenames):
+            return
+        if not files:
+            logger.info("[file_reader] referenced file but cache is empty")
             return
         selected, ambiguous = self.cache.choose(scope, req.prompt or "")
         if ambiguous:
             options = "、".join(doc.filename for doc in files)
             context = (
-                f"当前会话有多份文件：{options}。"
-                "请先询问用户要分析哪一份，不要自行猜测文件内容。"
+                f"当前会话未能唯一匹配所请求的文件。可用文件：{options}。"
+                "请先询问用户要分析哪一份；如果用户指定的文件不在列表中，请提示重新上传。"
             )
         elif selected:
             context = build_file_context(selected)
         else:
             return
         req.extra_user_content_parts.append(TextPart(text=context).mark_as_temp())
+        logger.info(f"[file_reader] request matched files={len(selected) if not ambiguous else 0} ambiguous={ambiguous}")
 
     def get_stats(self) -> Dict:
         return {
@@ -725,4 +772,4 @@ class astrbot_plugin_file_reader(Star):
                 await self._sweeper
             except asyncio.CancelledError:
                 pass
-        self.cache._entries.clear()
+        self.cache.clear()

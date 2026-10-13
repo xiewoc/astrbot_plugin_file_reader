@@ -1,6 +1,6 @@
 name: astrbot_plugin_file_reader
 desc: 一个将文件内容传给llm的插件
-help: 无特殊用法，正常使用便可
+help: 上传文件后用 /readfiles 查看本会话缓存；提及文件名提问才读取内容（不支持扫描 PDF）
 version: v1.0.3
 author: xiewoc 
 repo: https://github.com/xiewoc/astrbot_plugin_file_reader
