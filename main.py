@@ -6,6 +6,12 @@ from astrbot.api.all import *                                   # pyright: ignor
 from astrbot.api import logger                                  # pyright: ignore[reportMissingImports]
 
 import os
+import asyncio
+import hashlib
+import time
+
+from astrbot.core.agent.message import TextPart
+from .session_cache import SessionFileCache, build_file_context, make_scope, mentions_file
 from datetime import datetime as dt  # 正确导入datetime类
 from enum import Enum
 from dataclasses import dataclass
@@ -15,14 +21,17 @@ import tempfile
 import traceback
 from functools import lru_cache
 import warnings
+from zipfile import BadZipFile, ZipFile
 
 # 可选依赖导入，提供更好的错误信息
 try:
-    from pdfminer.high_level import extract_text as pdf_extract_text
+    from pdfminer.high_level import extract_pages as pdf_extract_pages
+    from pdfminer.layout import LTTextContainer
     PDFMINER_AVAILABLE = True
 except ImportError:
     PDFMINER_AVAILABLE = False
-    pdf_extract_text = None
+    pdf_extract_pages = None
+    LTTextContainer = None
 
 try:
     import docx2txt
@@ -144,7 +153,7 @@ FILE_TYPES_CONFIG = {
         category=FileCategory.TEXT,
         handler="read_text_file",
         mime_types={"text/plain", "text/x-python", "application/json", "text/xml", "text/html"},
-        max_size=10 * 1024 * 1024  # 10MB限制
+        max_size=20 * 1024 * 1024  # 与插件单文件大小上限保持一致
     ),
 }
 
@@ -346,19 +355,39 @@ class FileReader:
             f"无法解码文件 {file_path}，尝试的编码: {encodings_to_try}，最后错误: {last_error}"
         )
     
-    def read_pdf_to_text(self, file_path: Path) -> str:
-        """读取PDF文件"""
+    def read_pdf_to_text(self, file_path: Path, max_length: int = 40000) -> str:
+        """Extract page-by-page and stop at the text/page budget."""
         if not PDFMINER_AVAILABLE:
             raise DependencyMissingError("需要安装 pdfminer.six 库")
-            
+        # pdfminer still expands each page internally. A per-page memory limit
+        # cannot be guaranteed in this Python process; keep a conservative
+        # compressed input cap and do not parse large untrusted PDFs.
+        if file_path.stat().st_size > 5 * 1024 * 1024:
+            raise FileTooLargeError("PDF 文件超过保守的 5 MB 安全限制")
+        parts = []
+        count = 0
+        limit = max_length if max_length else 40000
         try:
-            # 使用io.StringIO捕获输出
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                text = pdf_extract_text(str(file_path))
-                return text.strip()
-        except Exception as e:
-            raise FileReaderError(f"读取PDF文件失败: {e}")
+                for page_idx, page in enumerate(
+                    pdf_extract_pages(str(file_path), maxpages=60, caching=False)
+                ):
+                    for element in page:
+                        if isinstance(element, LTTextContainer):
+                            raw = element.get_text()
+                            room = limit + 1 - count
+                            if room <= 0:
+                                break
+                            parts.append(raw[:room])
+                            count += min(len(raw), room)
+                    if count > limit or page_idx >= 59:
+                        break
+            return "".join(parts).strip()
+        except (FileReaderError, FileTooLargeError):
+            raise
+        except Exception as exc:
+            raise FileReaderError(f"读取 PDF 失败（{type(exc).__name__}）") from exc
     
     def convert_doc_to_docx(self, doc_file: Path, docx_file: Path) -> None:
         """转换DOC到DOCX格式"""
@@ -414,28 +443,26 @@ class FileReader:
             raise DependencyMissingError("需要安装 pandas 库")
             
         try:
-            # 尝试读取所有工作表
-            excel_file = pd.ExcelFile(file_path)
+            # ExcelFile must be closed, especially on Windows where open
+            # handles can prevent cleanup of AstrBot's temporary attachments.
             results = []
-            
-            for sheet_name in excel_file.sheet_names:
-                try:
-                    df = pd.read_excel(excel_file, sheet_name=sheet_name)
-                    
-                    # 处理空表
-                    if df.empty:
-                        results.append(f"工作表: {sheet_name} (空)")
-                        continue
-                    
-                    # 转换为文本
-                    text = df.to_string(index=False, na_rep='NA')
-                    results.append(f"工作表: {sheet_name}\n{text}")
-                    
-                except Exception as e:
-                    results.append(f"工作表: {sheet_name} (读取失败: {str(e)})")
-                    continue
-            
-            return "\n\n" + "="*50 + "\n\n".join(results)
+            parsed_sheets = 0
+            with pd.ExcelFile(file_path) as excel_file:
+                for sheet_name in excel_file.sheet_names:
+                    try:
+                        df = pd.read_excel(excel_file, sheet_name=sheet_name, header=None)
+                        parsed_sheets += 1
+                        if df.empty:
+                            results.append(f"工作表: {sheet_name} (空)")
+                            continue
+                        text = df.to_string(index=False, na_rep="NA")
+                        results.append(f"工作表: {sheet_name}\n{text}")
+                    except Exception as e:
+                        results.append(f"工作表: {sheet_name} (读取失败: {type(e).__name__})")
+
+            if not parsed_sheets:
+                raise FileReaderError("Excel 所有工作表均读取失败")
+            return "\n\n" + "=" * 50 + "\n\n".join(results)
             
         except Exception as e:
             raise FileReaderError(f"读取Excel文件失败: {e}")
@@ -523,6 +550,32 @@ class FileReader:
             file_path, file_type = self.validate_file(file_path)
             
             # 检查依赖
+            # Guard compressed Office formats against oversized expansion.
+            with file_path.open("rb") as header_file:
+                zip_header = header_file.read(4).startswith(b"PK\x03\x04")
+            if file_type in {"docx", "excel", "pptx"} and (
+                file_path.suffix.lower() in {".docx", ".xlsx", ".xlsm", ".pptx", ".ods", ".odp"}
+                or zip_header
+            ):
+                try:
+                    with ZipFile(file_path) as archive:
+                        entries = archive.infolist()
+                        expanded = sum(entry.file_size for entry in entries)
+                        if len(entries) > 2000 or expanded > 80 * 1024 * 1024:
+                            raise FileReaderError("Office 文件解压后体积过大")
+                        for entry in entries:
+                            if entry.file_size > 40 * 1024 * 1024:
+                                raise FileReaderError("Office 文件内部条目过大")
+                            if entry.flag_bits & 1:
+                                raise FileReaderError("暂不支持加密的 Office 文件")
+                            if (
+                                entry.file_size > 1024 * 1024
+                                and entry.file_size > max(entry.compress_size, 1) * 400
+                            ):
+                                raise FileReaderError("Office 文件压缩比例异常")
+                except BadZipFile as exc:
+                    raise FileReaderError("不是有效的 Office 文档") from exc
+
             self.check_dependencies(file_type)
             
             # 选择处理函数
@@ -540,8 +593,10 @@ class FileReader:
                 raise UnsupportedFileError(f"没有找到处理 {file_type} 的处理器")
             
             # 读取文件
-            content = handler(file_path)
-            
+            content = handler(file_path, max_length=max_length) if file_type == "pdf" else handler(file_path)
+            if not content or not content.strip():
+                raise FileReaderError("文件没有可提取的文字（扫描版 PDF 暂不支持）")
+
             # 限制长度
             if max_length and len(content) > max_length:
                 content = content[:max_length] + f"\n\n[内容截断，总长度: {len(content):,} 字符]"
@@ -581,108 +636,140 @@ def read_any_file_to_text(file_path: str, max_length: Optional[int] = None) -> s
     except Exception as e:
         return f"读取文件时发生错误: {str(e)}"
 
-@register("astrbot_plugin_file_reader", "xiewoc", 
-          "一个将文件内容传给llm的插件", "1.0.3", 
+@register("astrbot_plugin_file_reader", "xiewoc",
+          "一个将文件内容传给llm的插件", "1.0.3",
           "https://github.com/xiewoc/astrbot_plugin_file_reader")
 class astrbot_plugin_file_reader(Star):
+    """Read files on upload, but invoke the LLM only for file-related questions."""
+
     def __init__(self, context: Context):
         super().__init__(context)
-        self.current_file_info: Optional[Dict] = None
-        self.file_reader = FileReader(max_file_size=100 * 1024 * 1024)  # 限制10MB
-        self.reading_history = []  # 读取历史记录
-        
-    async def _process_file(self, file_item: Comp.File) -> Optional[Dict]:
-        """处理单个文件"""
+        self.file_reader = FileReader(max_file_size=20 * 1024 * 1024)
+        self.cache = SessionFileCache()
+        self._reader_semaphore = asyncio.Semaphore(1)
+        self._sweeper = None
+        self.reading_history = []
+
+    async def _sweep_periodically(self):
+        while True:
+            await asyncio.sleep(60)
+            self.cache.sweep()
+
+    def _read_local_file(self, path: str) -> tuple[str, str, bool]:
+        """Read AstrBot's existing local copy without modifying it."""
+        digest = hashlib.sha256()
+        with open(path, "rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        content = self.file_reader.read_file(path, max_length=40000)
+        truncated = "[内容截断" in content or len(content) > 40000
+        return digest.hexdigest(), content[:40000], truncated
+
+    async def _process_file(self, item: Comp.File, scope: str, received_at: float) -> bool:
+        label = hashlib.sha256(scope.encode()).hexdigest()[:10]
         try:
-            # 获取文件
-            file_path = await file_item.get_file()
-            logger.info(f"接收到文件: {file_path}")
-            
-            # 读取文件内容
-            content = self.file_reader.read_file(file_path, max_length=100000)  # 限制100K字符
-            
-            # 记录读取历史
-            self.reading_history.append({
-                "filename": Path(file_path).name,
-                "timestamp": dt.now().isoformat(),  # 使用dt.now()
-                "size": Path(file_path).stat().st_size if Path(file_path).exists() else 0,
-                "success": True
-            })
-            
-            # 限制历史记录长度
-            if len(self.reading_history) > 100:
+            path = await asyncio.wait_for(item.get_file(), timeout=20)
+            if not path:
+                raise FileNotFoundError("附件尚未下载")
+            if Path(path).stat().st_size > self.file_reader.max_file_size:
+                raise FileTooLargeError("附件超过 20 MB 的读取上限")
+            async with self._reader_semaphore:
+                digest, content, truncated = await asyncio.to_thread(
+                    self._read_local_file, path
+                )
+            if not content.strip():
+                logger.warning("文件无可读取的文字，可能是扫描版 PDF")
+                return False
+            name = Path(str(getattr(item, "name", "") or path).replace("\\", "/")).name
+            added = self.cache.add(
+                scope, filename=name, digest=digest,
+                text=content, truncated=truncated, received_at=received_at,
+            )
+            if added:
+                self.reading_history.append({
+                    "filename": name,
+                    "timestamp": dt.now().isoformat(),
+                    "success": True,
+                })
                 self.reading_history = self.reading_history[-50:]
-            
-            return {
-                "path": file_path,
-                "name": Path(file_path).name,
-                "content": content,
-                "size": len(content)
-            }
-            
-        except FileNotFoundError:
-            logger.error(f"文件不存在: {file_path}")
-        except FileTooLargeError as e:
-            logger.error(f"文件过大: {str(e)}")
-        except UnsupportedFileError as e:
-            logger.warning(f"不支持的文件格式: {str(e)}")
-        except DependencyMissingError as e:
-            logger.error(f"缺少依赖: {str(e)}")
-        except Exception as e:
-            logger.error(f"读取文件失败: {str(e)}\n{traceback.format_exc()}")
-            
-        return None
-    
-    @event_message_type(EventMessageType.ALL)               # type: ignore
+            logger.info(
+                f"[file_reader] parsed scope={label} size_chars={len(content)} "
+                f"stored={added} truncated={truncated}"
+            )
+            return added
+        except TimeoutError:
+            logger.warning(f"[file_reader] download timeout scope={label} limit=20s")
+        except (FileNotFoundError, FileTooLargeError, UnsupportedFileError,
+                DependencyMissingError, FileReaderError) as exc:
+            # Do not log untrusted paths, original file content or access tokens.
+            logger.warning(f"[file_reader] failed scope={label} cause={type(exc).__name__}")
+        except Exception:
+            logger.error(f"[file_reader] unexpected failure scope={label}")
+        return False
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_receive_msg(self, event: AstrMessageEvent):
-        """当获取到有文件时"""
-        if event.is_at_or_wake_command:
-            file_items = []
-            
-            # 收集所有文件
-            for item in event.message_obj.message:
-                if isinstance(item, Comp.File):
-                    file_items.append(item)
-            
-            # 处理文件
-            for file_item in file_items:
-                file_info = await self._process_file(file_item)
-                
-                if file_info and file_info["content"]:
-                    self.current_file_info = file_info
-                    logger.info(f"成功读取文件: {file_info['name']}，大小: {len(file_info['content']):,} 字符")
-                    
-                    # 可以在这里发送确认消息
-                    # await event.reply(f"已读取文件: {file_info['name']}")
-                else:
-                    logger.warning(f"读取文件内容为空或失败")
-                    self.current_file_info = None
-    
+        """File attachments need not carry an @ mention or wake command."""
+        scope = make_scope(event)
+        received_at = time.monotonic()
+        if self._sweeper is None or self._sweeper.done():
+            self._sweeper = asyncio.create_task(self._sweep_periodically())
+        files = [item for item in event.get_messages() if isinstance(item, Comp.File)]
+        if files:
+            label = hashlib.sha256(scope.encode()).hexdigest()[:10]
+            logger.info(f"[file_reader] attachment event scope={label} count={len(files)}")
+        for item in files:
+            await self._process_file(item, scope, received_at)
+        # Do not auto-reply: duplicate acknowledgments in multi-bot groups
+        # are more disruptive than a silent upload. /readfiles lists uploads.
+
+    @filter.command("readfiles")
+    async def list_files(self, event: AstrMessageEvent):
+        """Show files visible to the current group or private conversation."""
+        files = self.cache.list(make_scope(event))
+        if not files:
+            yield event.plain_result("当前会话没有已读取文件。请先发送附件；若已发送，请检查 AstrBot 日志中的 [file_reader] 记录。")
+            return
+        names = "\n".join(f"• {doc.filename}" for doc in files)
+        yield event.plain_result(f"当前会话的文件：\n{names}")
+
     @filter.on_llm_request()
     async def on_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        """将文件内容添加到LLM请求"""
-        if self.current_file_info and self.current_file_info["content"]:
-            file_info = self.current_file_info
-            
-            # 格式化文件内容
-            file_context = (
-                f"\nFile name:{file_info['name']}\n"
-                f"\n[SOF]\n"
-                f"{file_info['content']}\n"
-                f"[EOF]\n"
+        """Only include text from a file in the requesting chat's scope."""
+        scope = make_scope(event)
+        files = self.cache.list(scope)
+        filenames = [name for file in files for name in file.filenames]
+        if not mentions_file(req.prompt or "", filenames):
+            return
+        if not files:
+            logger.info("[file_reader] referenced file but cache is empty")
+            return
+        selected, ambiguous = self.cache.choose(scope, req.prompt or "")
+        if ambiguous:
+            options = "、".join(doc.filename for doc in files)
+            context = (
+                f"当前会话未能唯一匹配所请求的文件。可用文件：{options}。"
+                "请先询问用户要分析哪一份；如果用户指定的文件不在列表中，请提示重新上传。"
             )
-            
-            # 添加到提示词
-            req.prompt += file_context
-            logger.info(f"已将文件 {file_info['name']} 内容添加到请求中")
-            
-            # 清空当前文件信息
-            self.current_file_info = None
-    
+        elif selected:
+            context = build_file_context(selected)
+        else:
+            return
+        req.extra_user_content_parts.append(TextPart(text=context).mark_as_temp())
+        logger.info(f"[file_reader] request matched files={len(selected) if not ambiguous else 0} ambiguous={ambiguous}")
+
     def get_stats(self) -> Dict:
-        """获取插件统计信息"""
         return {
             "total_read": len(self.reading_history),
-            "success_read": sum(1 for h in self.reading_history if h.get("success", False)),
-            "recent_files": self.reading_history[-10:] if self.reading_history else []
+            "success_read": sum(1 for h in self.reading_history if h.get("success")),
+            "recent_files": self.reading_history[-10:],
         }
+
+    async def terminate(self):
+        if self._sweeper is not None:
+            self._sweeper.cancel()
+            try:
+                await self._sweeper
+            except asyncio.CancelledError:
+                pass
+        self.cache.clear()
